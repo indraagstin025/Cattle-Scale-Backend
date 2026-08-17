@@ -1,0 +1,251 @@
+// ============================================================================
+// Prisma Schema — Smart Livestock Management System (FINAL)
+// Single source of truth untuk skema database PostgreSQL (Supabase)
+//
+// Direkonsiliasi dari: URD Revisi 2.0 (Section 7 & 7.1) + hasil review teknis.
+// 7 model pertama = MENGIKUTI URD SECARA LITERAL (kolom, tipe, relasi, index).
+// 2 model terakhir (AuditLog, BreedGrowthStandard) = TAMBAHAN DI LUAR URD,
+// hasil rekomendasi gap yang sudah disepakati sebelumnya — hapus section ini
+// kalau belum ingin diimplementasikan sekarang.
+//
+// Deviasi dari draf review sebelumnya yang di-REVERT setelah baca URD lengkap:
+//   - WeightLog.cattleId: kembali NOT NULL + onDelete Cascade (sesuai URD 7.1)
+//   - WebSession.sessionToken: kembali VarChar(255) (sistem ini tanpa JWT/akun)
+//   - Device.lastSeenAt: kembali default now() (status online/offline dikontrol
+//     eksplisit via heartbeat, bukan diturunkan dari lastSeenAt)
+//   - Enum (DeviceStatus/CattleGender/CattleStatus) di-revert ke String+CHECK
+//     agar tipe kolom DB tetap VARCHAR sesuai DDL URD, bukan native PG enum
+//
+// Optimasi baru yang ditemukan saat rekonsiliasi ini (tidak ada di URD):
+//   - Index idx_cattle_tag_id, idx_devices_api_key, idx_web_sessions_token
+//     DIHAPUS — redundan karena kolomnya sudah UNIQUE (Postgres otomatis
+//     membuat index untuk UNIQUE constraint)
+//
+// CATATAN: constraint di bawah ini TIDAK bisa diekspresikan native oleh Prisma,
+// tambahkan lewat raw SQL migration terpisah (lihat blok paling bawah file):
+//   a. gender IN ('male','female') — CHECK constraint (sesuai URD)
+//   b. Hanya 1 FirmwareRelease yang boleh isActive = true (partial unique index)
+//   c. PairingCode.code harus unik selama belum used (partial unique index)
+//   d. WeightLog tidak boleh device_id null DAN cattle_id... (tidak relevan lagi,
+//      karena cattleId sekarang NOT NULL — otomatis selalu ada sumber cattle)
+//   e. Device.batteryLevel BETWEEN 0 AND 100
+//   f. WeightLog.weight > 0
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ── 1. Tabel Perangkat Timbangan ESP32 ──────────────────────────────────────
+
+model Device {
+  id              String    @id @default(uuid())
+  deviceCode      String    @unique @map("device_code") @db.VarChar(50)
+  name            String    @db.VarChar(100)
+  apiKey          String    @unique @map("api_key") @db.VarChar(100)
+  location        String?   @db.VarChar(100)
+  batteryLevel    Int       @default(100) @map("battery_level")
+  wifiRssi        Int?      @map("wifi_rssi")
+  status          String    @default("offline") @db.VarChar(20) // 'online' | 'offline' | 'weighing'
+  firmwareVersion String?   @map("firmware_version") @db.VarChar(20)
+  lastSeenAt      DateTime? @default(now()) @map("last_seen_at") @db.Timestamptz()
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz() // soft delete
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  weightLogs   WeightLog[]
+  pairingCodes PairingCode[]
+  webSessions  WebSession[]
+
+  // Catatan: tidak perlu @@index([apiKey]) — @unique sudah otomatis
+  // membuat index di Postgres. Index eksplisit di URD DDL redundan.
+  @@map("devices")
+}
+
+// ── 2. Tabel Profil Ternak Sapi ──────────────────────────────────────────
+
+model Cattle {
+  id            String    @id @default(uuid())
+  tagId         String    @unique @map("tag_id") @db.VarChar(50)
+  name          String?   @db.VarChar(100)
+  breed         String    @db.VarChar(50) // 'Bali', 'Limousin', 'Simmental', 'Brahman', 'Angus', 'PO', 'Madura', dll.
+  gender        String    @db.VarChar(10) // 'male' | 'female' — CHECK constraint, lihat raw SQL
+  birthDate     DateTime? @map("birth_date") @db.Date
+  // age_months TIDAK disimpan statis — dihitung on-the-fly di query/API (sesuai URD)
+  initialWeight Decimal   @map("initial_weight") @db.Decimal(6, 2)
+  targetWeight  Decimal?  @map("target_weight") @db.Decimal(6, 2)
+  currentWeight Decimal?  @map("current_weight") @db.Decimal(6, 2) // disinkronkan via trigger DB + WeightService
+  status        String    @default("active") @db.VarChar(20) // 'active' | 'sold' | 'quarantine' | 'deceased'
+  notes         String?   @db.Text
+  deletedAt     DateTime? @map("deleted_at") @db.Timestamptz() // soft delete
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  weightLogs WeightLog[]
+
+  // Catatan: tidak perlu @@index([tagId]) — @unique sudah otomatis membuat index.
+  @@index([breed], map: "idx_cattle_breed")
+  @@index([status], map: "idx_cattle_status")
+  @@map("cattle")
+}
+
+// ── 3. Tabel Riwayat Penimbangan ──────────────────────────────────────────
+
+model WeightLog {
+  id       String @id @default(uuid())
+  // Wajib diisi & onDelete Cascade sesuai URD Section 7.1 — setiap weigh-in
+  // selalu menyertakan tag_id, jadi cattle selalu diketahui saat insert.
+  cattleId String @map("cattle_id")
+  cattle   Cattle @relation(fields: [cattleId], references: [id], onDelete: Cascade)
+
+  deviceId String? @map("device_id")
+  device   Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  weight         Decimal  @db.Decimal(6, 2)
+  isStable       Boolean  @default(true) @map("is_stable")
+  idempotencyKey String?  @unique @map("idempotency_key") @db.VarChar(100) // cegah duplikasi retry ESP32
+  weighedAt      DateTime @map("weighed_at") @db.Timestamptz() // waktu ASLI penimbangan, bukan waktu terima
+  notes          String?  @db.Text
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  // daily_gain/ADG TIDAK disimpan statis — dihitung via window function saat query (sesuai URD)
+
+  @@index([cattleId, weighedAt(sort: Desc)], map: "idx_weight_logs_cattle_date")
+  @@index([deviceId], map: "idx_weight_logs_device_id") // tambahan: query log per device (debugging)
+  @@map("weight_logs")
+}
+
+// ── 4. Tabel Pengaturan Sistem ────────────────────────────────────────────
+
+model SystemSetting {
+  key         String   @id @db.VarChar(50)
+  value       Json     @db.JsonB
+  description String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz() // tambahan: konsistensi audit antar tabel
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  @@map("system_settings")
+}
+
+// ── 5. Tabel Kode Pairing Sementara ───────────────────────────────────────
+
+model PairingCode {
+  id        String   @id @default(uuid())
+  deviceId  String   @map("device_id")
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  code      String   @db.VarChar(10)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz()
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  // Unik-nya code hanya berlaku selama belum used — perlu partial unique
+  // index via raw SQL migration (Prisma tidak bisa expresikan WHERE di @@unique).
+  @@index([code], map: "idx_pairing_codes_code")
+  @@map("pairing_codes")
+}
+
+// ── 6. Tabel Sesi Web yang Sudah Paired ───────────────────────────────────
+
+model WebSession {
+  id             String    @id @default(uuid())
+  sessionToken   String    @unique @map("session_token") @db.VarChar(255) // sesuai URD — sistem tanpa akun/JWT
+  label          String?   @db.VarChar(100) // e.g. "Safari iPhone Peternak"
+  pairedDeviceId String?   @map("paired_device_id")
+  pairedDevice   Device?   @relation(fields: [pairedDeviceId], references: [id], onDelete: SetNull)
+  revoked        Boolean   @default(false)
+  lastActiveAt   DateTime  @default(now()) @map("last_active_at") @db.Timestamptz()
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  // Catatan: tidak perlu @@index([sessionToken]) — @unique sudah otomatis membuat index.
+  @@map("web_sessions")
+}
+
+// ── 7. Tabel Rilis Firmware untuk OTA ─────────────────────────────────────
+
+model FirmwareRelease {
+  id         String   @id @default(uuid())
+  version    String   @unique @db.VarChar(20)
+  binaryUrl  String   @map("binary_url") @db.Text
+  changelog  String?  @db.Text
+  isActive   Boolean  @default(true) @map("is_active")
+  releasedAt DateTime @default(now()) @map("released_at") @db.Timestamptz()
+
+  // Hanya boleh ada 1 row isActive = true pada satu waktu — perlu partial
+  // unique index via raw SQL migration.
+  @@map("firmware_releases")
+}
+
+// ============================================================================
+// ── TAMBAHAN DI LUAR 7 TABEL RESMI URD ──────────────────────────────────────
+// Hasil rekomendasi gap yang sudah disepakati (lihat checklist_pengerjaan_v2.md,
+// bagian "Catatan & Gap"). Hapus 2 model di bawah kalau belum ingin diimplementasikan.
+// ============================================================================
+
+// 8. Audit trail — pencatatan pelaku setiap perubahan data (Section 11.8 URD)
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorType  String   @map("actor_type") @db.VarChar(20) // 'device' | 'web_session'
+  actorId    String   @map("actor_id") // deviceId ATAU webSession.id
+  action     String   @db.VarChar(20) // 'create' | 'update' | 'delete'
+  entityType String   @map("entity_type") @db.VarChar(50) // 'cattle', 'device', dst
+  entityId   String   @map("entity_id")
+  changes    Json?    @db.JsonB // snapshot sebelum/sesudah, opsional
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  @@index([entityType, entityId], map: "idx_audit_logs_entity")
+  @@map("audit_logs")
+}
+
+// 9. Standar baku ADG per ras — dipakai UR-04 (Analitik Pertumbuhan)
+// Diisi manual via Settings, atau di-seed dari data riset per ras.
+// PENTING: sumber angka acuan masih perlu dikonfirmasi ke product owner.
+model BreedGrowthStandard {
+  breed       String   @id @db.VarChar(50)
+  expectedAdg Decimal  @map("expected_adg") @db.Decimal(4, 2) // Kg/hari
+  source      String?  @db.Text // sumber angka, misal referensi riset/peternakan
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  @@map("breed_growth_standards")
+}
+
+// ============================================================================
+// Raw SQL tambahan (jalankan lewat migration terpisah setelah `prisma migrate`)
+// ============================================================================
+//
+// -- a. Gender hanya 'male' atau 'female' (sesuai URD)
+// ALTER TABLE cattle
+//   ADD CONSTRAINT chk_cattle_gender CHECK (gender IN ('male', 'female'));
+//
+// -- b. Hanya 1 firmware aktif dalam satu waktu
+// CREATE UNIQUE INDEX idx_one_active_firmware
+//   ON firmware_releases (is_active) WHERE is_active = true;
+//
+// -- c. Kode pairing unik selama belum dipakai
+// CREATE UNIQUE INDEX idx_pairing_code_unique_pending
+//   ON pairing_codes (code) WHERE used = false;
+//
+// -- d. Battery level harus 0-100
+// ALTER TABLE devices
+//   ADD CONSTRAINT chk_battery_level_range CHECK (battery_level BETWEEN 0 AND 100);
+//
+// -- e. Weight harus positif
+// ALTER TABLE weight_logs
+//   ADD CONSTRAINT chk_weight_positive CHECK (weight > 0);
+//
+// -- f. Trigger sinkronisasi current_weight (safety net — tetap ditulis
+//    eksplisit juga di WeightService, lihat catatan arsitektur URD Section 7)
+// CREATE OR REPLACE FUNCTION sync_current_weight() RETURNS TRIGGER AS $$
+// BEGIN
+//   UPDATE cattle SET current_weight = NEW.weight, updated_at = NOW()
+//   WHERE id = NEW.cattle_id;
+//   RETURN NEW;
+// END;
+// $$ LANGUAGE plpgsql;
+//
+// CREATE TRIGGER trg_sync_current_weight
+// AFTER INSERT ON weight_logs
+// FOR EACH ROW EXECUTE FUNCTION sync_current_weight();
