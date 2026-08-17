@@ -11,9 +11,13 @@ import { env } from "./env.config.js";
  * 
  * PERINGATAN: Key ini JANGAN pernah diekspos ke Frontend/Client.
  */
-export const supabaseAdmin = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-    auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-    },
-});
+export const supabaseAdmin = createClient(
+    env.SUPABASE_URL || "https://placeholder.supabase.co",
+    env.SUPABASE_SERVICE_ROLE_KEY || "placeholder-service-role-key",
+    {
+        auth: {
+            autoRefreshToken: false,
+            persistSession: false,
+        },
+    }
+);
